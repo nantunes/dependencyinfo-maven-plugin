@@ -37,9 +37,9 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.URL;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -55,23 +55,25 @@ public class DependencyInfo extends AbstractMojo {
     JSONParser parser = new JSONParser();
 
     String bundleXmlString = "";
-    String dependenciesJsonString = "";
-    RequireJsMerger merger = null;
-    HashMap<String, String> selfDependencies = null;
+
+    RequireJsMerger testsMerger = null;
+    Map<String, String> selfDependencies = null;
 
     boolean jsUnitTests = false;
     List<Profile> activeProfiles = mavenProject.getActiveProfiles();
     getLog().info(activeProfiles.toString());
-    for (Profile p: activeProfiles) {
-      if(p.getId().equals("jsUnitTests")) {
+    for (Profile p : activeProfiles) {
+      if (p.getId().equals("jsUnitTests")) {
         jsUnitTests = true;
 
-        merger = new RequireJsMerger();
+        testsMerger = new RequireJsMerger();
         selfDependencies = new HashMap<>();
 
         break;
       }
     }
+
+    String dependenciesJsonString = "";
 
     for (Dependency dep : dependencyArtifacts) {
       final boolean isRuntime = dep.getScope().equals("runtime");
@@ -86,94 +88,104 @@ public class DependencyInfo extends AbstractMojo {
           } else if (dep.getArtifactId().equals("pentaho-requirejs-osgi-manager")) {
             prefix = "mvn:";
             isDependency = "true";
+          } else {
+            continue;
           }
         } else if (dep.getGroupId().startsWith("org.webjars")) {
           prefix = "pentaho-webjars:mvn:";
 
-          if(isRuntimeOrProvided) {
-            dependenciesJsonString += "\"pentaho-webjar-deployer:" + dep.getGroupId() + "/" + dep.getArtifactId() + "\": \"" + dep.getVersion() + "\",\n";
-          }
+          try {
+            WebjarsURLConnection connection = new WebjarsURLConnection(new URL(null, "mvn:" + dep.getGroupId() + "/" + dep.getArtifactId() + "/" + dep.getVersion(), mavenUrlHandler));
+            connection.connect();
 
-          if(jsUnitTests) {
-            try {
-              WebjarsURLConnection connection = new WebjarsURLConnection(new URL(null, "mvn:" + dep.getGroupId() + "/" + dep.getArtifactId() + "/" + dep.getVersion(), mavenUrlHandler));
-              connection.connect();
+            InputStream inputStream = connection.getInputStream();
+            File tempFile = File.createTempFile("webjar", ".zip");
+            FileOutputStream fileOutputStream = new FileOutputStream(tempFile);
+            IOUtils.copy(inputStream, fileOutputStream);
+            fileOutputStream.close();
 
-              InputStream inputStream = connection.getInputStream();
-              File tempFile = File.createTempFile("webjar", ".zip");
-              FileOutputStream fileOutputStream = new FileOutputStream(tempFile);
-              IOUtils.copy(inputStream, fileOutputStream);
-              fileOutputStream.close();
+            ZipFile zipInputStream = new ZipFile(tempFile);
+            ZipEntry entry = zipInputStream.getEntry("META-INF/js/require.json");
 
-              ZipFile zipInputStream = new ZipFile(tempFile);
-              ZipEntry entry = zipInputStream.getEntry("META-INF/js/require.json");
+            String jsonFile = IOUtils.toString(zipInputStream.getInputStream(entry), "UTF-8");
+            JSONObject json = (JSONObject) parser.parse(jsonFile);
 
-              String jsonFile = IOUtils.toString(zipInputStream.getInputStream(entry), "UTF-8");
-              JSONObject json = (JSONObject) parser.parse(jsonFile);
+            tempFile.delete();
 
-              merger.merge(json);
+            if (isRuntimeOrProvided) {
+              if (json.containsKey("requirejs-osgi-meta")) {
+                Map<String, Object> runtimeMeta = (Map<String, Object>) json.get("requirejs-osgi-meta");
+                if (runtimeMeta.containsKey("modules")) {
+                  Map<String, Map<String, Map<String, ?>>> availableModules = (Map<String, Map<String, Map<String, ?>>>) runtimeMeta.get("modules");
+                  for (String module : availableModules.keySet()) {
+                    final Map<String, Map<String, ?>> moduleInfo = availableModules.get(module);
 
-              tempFile.delete();
-
-              selfDependencies.put("pentaho-webjar-deployer:" + dep.getGroupId() + "/" + dep.getArtifactId(), dep.getVersion());
-            } catch (Exception e) {
-              getLog().error(e.getMessage());
+                    for (String version : moduleInfo.keySet()) {
+                      dependenciesJsonString += "\"" + module + "\": \"" + version + "\",\n";
+                    }
+                  }
+                }
+              }
             }
+
+            if (jsUnitTests) {
+              testsMerger.merge(json);
+              selfDependencies.put("mvn:" + dep.getGroupId() + "/" + dep.getArtifactId(), dep.getVersion());
+            }
+          } catch (Exception e) {
+            getLog().error(e.getMessage());
           }
         } else {
           continue;
         }
 
-        if(isRuntime) {
+        if (isRuntime) {
           bundleXmlString += "<bundle dependency=\"" + isDependency + "\">" + prefix + dep.getGroupId() + "/" + dep.getArtifactId() + "/" + dep.getVersion() + (dep.getType().equals("jar") ? "" : "/" + dep.getType()) + "</bundle>";
         }
       }
     }
 
-    mavenProject.getProperties().setProperty("dependencyinfo.ui-bundles", bundleXmlString);
-
-    if(!dependenciesJsonString.isEmpty()) {
-      dependenciesJsonString = dependenciesJsonString.substring(0, dependenciesJsonString.length()-2);
+    if (!dependenciesJsonString.isEmpty()) {
+      dependenciesJsonString = dependenciesJsonString.substring(0, dependenciesJsonString.length() - 2);
     }
-
     mavenProject.getProperties().setProperty("dependencyinfo.ui-dependencies", dependenciesJsonString);
 
-    if(jsUnitTests) {
+    mavenProject.getProperties().setProperty("dependencyinfo.ui-bundles", bundleXmlString);
+
+    if (jsUnitTests) {
       try {
-        JSONObject meta = new JSONObject();
+        Map<String, Object> meta = new HashMap<>();
 
-        JSONObject modules = new JSONObject();
-        JSONObject module = new JSONObject();
-        JSONObject ver = new JSONObject();
+        Map<String, Map<String, Map<String, Map<String, String>>>> modules = new HashMap<>();
+        Map<String, Map<String, Map<String, String>>> module = new HashMap<>();
+        Map<String, Map<String, String>> ver = new HashMap<>();
 
-        ver.put( "dependencies",  selfDependencies );
-        module.put( mavenProject.getVersion(), ver );
-        modules.put( mavenProject.getArtifactId(), module );
-        meta.put( "modules", modules );
+        ver.put("dependencies", selfDependencies);
+        module.put(mavenProject.getVersion(), ver);
+        modules.put(mavenProject.getArtifactId(), module);
+        meta.put("modules", modules);
 
-        JSONObject artifacts = new JSONObject();
-        JSONObject artifact = new JSONObject();
-        ver = new JSONObject();
+        Map<String, Map<String, Map<String, String>>> artifacts = new HashMap<>();
+        Map<String, Map<String, String>> artifact = new HashMap<>();
 
         HashMap<String, String> availableModules = new HashMap<>();
-        availableModules.put( mavenProject.getArtifactId(), mavenProject.getVersion() );
-        ver.put( "modules", availableModules );
-        artifact.put( mavenProject.getVersion(), ver );
-        artifacts.put( mavenProject.getArtifactId(), artifact );
-        meta.put( "artifacts", artifacts );
+        availableModules.put(mavenProject.getArtifactId(), mavenProject.getVersion());
+        artifact.put(mavenProject.getVersion(), availableModules);
+        artifacts.put(mavenProject.getArtifactId(), artifact);
+        meta.put("artifacts", artifacts);
 
-        JSONObject requireJsonObject = new JSONObject();
-        requireJsonObject.put( "requirejs-osgi-meta", meta );
+        Map<String, Object> requireJsonObject = new HashMap<>();
+        requireJsonObject.put("requirejs-osgi-meta", meta);
 
-        merger.merge(requireJsonObject);
+        testsMerger.merge(requireJsonObject);
       } catch (Exception e) {
         getLog().error(e.getMessage());
       }
 
-      JSONObject result = merger.getRequireConfig();
-      RequireJsDependencyResolver.processMetaInformation(result);
+      Map<String, Object> testsConfig = testsMerger.getRequireConfig();
+      RequireJsDependencyResolver.processMetaInformation(testsConfig);
 
-      mavenProject.getProperties().setProperty("dependencyinfo.test-dependencies", result.toJSONString());
+      mavenProject.getProperties().setProperty("dependencyinfo.test-dependencies", JSONObject.toJSONString(testsConfig));
     }
   }
 }
